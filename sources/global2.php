@@ -284,6 +284,10 @@ function init__global2()
 		}
 	}
 
+	define('STATIC_CACHE__FAST_SPIDER',1);
+	define('STATIC_CACHE__GUEST',2);
+	define('STATIC_CACHE__FAILOVER_MODE',4);
+
 	// Most critical things
 	require_code('support'); // A lot of support code is present in this
 	if (!running_script('webdav'))
@@ -295,6 +299,13 @@ function init__global2()
 			exit();
 		}
 	}
+	$force_failover=get_param_integer('keep_failover',NULL);
+	if (((isset($SITE_INFO['failover_mode'])) && ($SITE_INFO['failover_mode']=='on' || $SITE_INFO['failover_mode']=='auto_on') && ($force_failover!==0)) || ($force_failover===1))
+	{
+		$bot_type=get_bot_type();
+		require_code('static_cache');
+		static_cache((($bot_type!==NULL)?STATIC_CACHE__FAST_SPIDER:0) | STATIC_CACHE__FAILOVER_MODE);
+	}
 	if (($MICRO_BOOTUP==0) && ($MICRO_AJAX_BOOTUP==0)) // Fast cacheing for bots
 	{
 		if ((running_script('index')) && (count($_POST)==0))
@@ -302,7 +313,8 @@ function init__global2()
 			$bot_type=get_bot_type();
 			if (($bot_type!==NULL) && (isset($SITE_INFO['fast_spider_cache'])) && ($SITE_INFO['fast_spider_cache']!='0'))
 			{
-				fast_spider_cache(true);
+				require_code('static_cache');
+				static_cache(STATIC_CACHE__FAST_SPIDER);
 			}
 		}
 	}
@@ -344,9 +356,10 @@ function init__global2()
 	{
 		if ((running_script('index')) && (count($_POST)==0))
 		{
-			if ((isset($SITE_INFO['any_guest_cached_too'])) && ($SITE_INFO['any_guest_cached_too']=='1') && (is_guest(NULL,true)))
+			if ((isset($SITE_INFO['any_guest_cached_too'])) && ($SITE_INFO['any_guest_cached_too']=='1') && (is_guest(NULL,true)) && (get_param_integer('keep_failover',NULL)!==0))
 			{
-				fast_spider_cache(false);
+				require_code('static_cache');
+				static_cache(STATIC_CACHE__GUEST);
 			}
 		}
 	}
@@ -402,17 +415,6 @@ function init__global2()
 		}
 	}
 
-	if (($MICRO_AJAX_BOOTUP==0) && ($MICRO_BOOTUP==0))
-	{
-		// Before anything gets outputted
-		handle_logins();
-
-		require_code('site'); // This powers the site (top level page generation)
-
-		// Are we installed?
-		get_option('site_name');
-	}
-
 	// Our logging (change false to true for temporarily changing it so staff get logging)
 	if (get_option('log_php_errors')=='1')
 	{
@@ -427,6 +429,17 @@ function init__global2()
 
 	// G-zip?
 	safe_ini_set('zlib.output_compression',(get_option('gzip_output')=='1')?'On':'Off');
+
+	if (($MICRO_AJAX_BOOTUP==0) && ($MICRO_BOOTUP==0))
+	{
+		// Before anything gets outputted
+		handle_logins();
+
+		require_code('site'); // This powers the site (top level page generation)
+
+		// Are we installed?
+		get_option('site_name');
+	}
 
 	if ((function_exists('setlocale')) && ($MICRO_AJAX_BOOTUP==0))
 	{
@@ -602,83 +615,6 @@ function init__global2()
 			version_specific();
 			upgrade_modules();
 			ocf_upgrade();
-		}
-	}
-}
-
-/**
- * Find if we can use the fast spider cache.
- *
- * @return boolean			Whether we can
- */
-function can_fast_spider_cache()
-{
-	if (isset($_GET['keep_session'])) return false;
-	if (isset($_GET['redirect'])) return false;
-	if (isset($_GET['zone'])) return false;
-	if (isset($_GET['date'])) return false;
-	/*$url_easy=get_self_url_easy();
-	if (strpos($url_easy,'sort=')!==false) return false;	Actually this stops very useful caching, esp on the forum - better to just reduce the cache time to a fraction of an hour
-	if (strpos($url_easy,'start=')!==false) return false;
-	if (strpos($url_easy,'max=')!==false) return false;*/
-	return true;
-}
-
-/**
- * If possible dump the user to 100% static caching.
- *
- * @param  boolean			Whether to cache as a bot
- */
-function fast_spider_cache($bot=true)
-{
-	global $SITE_INFO;
-
-	require_code('urls');
-
-	if (!can_fast_spider_cache()) return;
-
-	$fast_cache_path=get_custom_file_base().'/persistent_cache/'.md5(serialize(get_self_url_easy()));
-	if (!$bot) $fast_cache_path.='__non-bot';
-	if (!array_key_exists('js_on',$_COOKIE)) $fast_cache_path.='__no-js';
-	if (is_mobile()) $fast_cache_path.='_mobile';
-	$fast_cache_path.='.gcd';
-	if (is_file($fast_cache_path))
-	{
-		$expires=intval(60.0*60.0*floatval($SITE_INFO['fast_spider_cache']));
-		$mtime=filemtime($fast_cache_path);
-		if ($mtime>time()-$expires)
-		{
-			if ($bot) // Only bots can do this, as they won't try to login and end up reaching a previously cached page
-			{
-				header("Pragma: public");
-				header("Cache-Control: max-age=".strval($expires));
-				header('Expires: '.gmdate('D, d M Y H:i:s',time()+$expires).' GMT');
-				header('Last-Modified: '.gmdate('D, d M Y H:i:s',$mtime).' GMT');
-
-				$since=ocp_srv('HTTP_IF_MODIFIED_SINCE');
-				if ($since!='')
-				{
-					if (strtotime($since)<$mtime)
-					{
-						header('HTTP/1.0 304 Not Modified');
-						exit();
-					}
-				}
-			}
-
-			if ((function_exists('gzencode')) && (php_function_allowed('ini_set')))
-			{
-				safe_ini_set('zlib.output_compression','Off');
-				header('Content-Encoding: gzip');
-			}
-
-			$contents=file_get_contents($fast_cache_path);
-			if (function_exists('ocp_mark_as_escaped')) ocp_mark_as_escaped($contents);
-			exit($contents);
-		} else
-		{
-			@unlink($fast_cache_path);
-			sync_file($fast_cache_path);
 		}
 	}
 }

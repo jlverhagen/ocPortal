@@ -164,7 +164,7 @@ function init__site()
 
 		$old_style=get_option('htm_short_urls')!='1';
 
-		if ((!headers_sent()) && (running_script('index')) && ($GLOBALS['NON_PAGE_SCRIPT']==0) && (isset($_SERVER['HTTP_HOST'])) && (count($_POST)==0) && ((strpos($ruri,'/pg/')===false) || (!$old_style)) && ((strpos($ruri,'.htm')===false) || ($old_style)))
+		if ((!headers_sent()) && (running_script('index')) && ($GLOBALS['NON_PAGE_SCRIPT']==0) && (isset($_SERVER['HTTP_HOST'])) && (count($_POST)==0) && (get_param_integer('keep_failover',NULL)!==0) && ((strpos($ruri,'/pg/')===false) || (!$old_style)) && ((strpos($ruri,'.htm')===false) || ($old_style)))
 		{
 			$GLOBALS['HTTP_STATUS_CODE']='301';
 			header('HTTP/1.0 301 Moved Permanently');
@@ -547,7 +547,7 @@ function process_monikers($page_name)
 				if (is_numeric($url_id)) // Lookup and redirect to moniker
 				{
 					$correct_moniker=find_id_moniker(array('page'=>$page_name,'type'=>get_param('type','misc'),'id'=>$url_id));
-					if (($correct_moniker!==NULL) && ($correct_moniker!=$url_id) && (count($_POST)==0)) // test is very unlikely to fail. Will only fail if the title of the resource was numeric - in which case the moniker was chosen to be the ID (NOT the number in the title, as that would have created ambiguity).
+					if (($correct_moniker!==NULL) && ($correct_moniker!=$url_id) && (count($_POST)==0) && (get_param_integer('keep_failover',NULL)!==0)) // test is very unlikely to fail. Will only fail if the title of the resource was numeric - in which case the moniker was chosen to be the ID (NOT the number in the title, as that would have created ambiguity).
 					{
 						header('HTTP/1.0 301 Moved Permanently');
 						$_new_url=build_url(array('page'=>'_SELF','id'=>$correct_moniker),'_SELF',NULL,true);
@@ -574,7 +574,7 @@ function process_monikers($page_name)
 					// Map back 'id'
 					$_GET['id']=$monikers[0]['m_resource_id']; // We need to know the ID number rather than the moniker
 
-					if (($deprecated) && (count($_POST)==0))
+					if (($deprecated) && (count($_POST)==0) && (get_param_integer('keep_failover',NULL)!==0))
 					{
 						$correct_moniker=find_id_moniker(array('page'=>$page_name,'type'=>get_param('type','misc'),'id'=>$monikers[0]['m_resource_id']));
 						if ($correct_moniker!=$url_id) // Just in case database corruption means ALL are deprecated
@@ -688,45 +688,75 @@ function do_site()
 	}
 
 	// Cacheing for spiders
-	if ((running_script('index')) && (count($_POST)==0) && (isset($GLOBALS['SITE_INFO']['fast_spider_cache'])) && ($GLOBALS['SITE_INFO']['fast_spider_cache']!='0') && (is_guest()))
+	global $SITE_INFO;
+	if ((running_script('index')) && (count($_POST)==0) && (isset($SITE_INFO['fast_spider_cache'])) && ($SITE_INFO['fast_spider_cache']!='0') && (is_guest()) && (!$GLOBALS['IS_ACTUALLY_ADMIN']))
 	{
 		$bot_type=get_bot_type();
-		if ((($bot_type!==NULL) || ((isset($GLOBALS['SITE_INFO']['any_guest_cached_too'])) && ($GLOBALS['SITE_INFO']['any_guest_cached_too']=='1'))) && (can_fast_spider_cache()))
+		$supports_failover_mode=(isset($SITE_INFO['failover_mode'])) && ($SITE_INFO['failover_mode']!='off');
+		$supports_guest_caching=(isset($SITE_INFO['any_guest_cached_too'])) && ($SITE_INFO['any_guest_cached_too']=='1');
+		require_code('static_cache');
+		if ((($bot_type!==NULL) || ($supports_failover_mode) || ($supports_guest_caching)) && (can_static_cache()))
 		{
-			$fast_cache_path=get_custom_file_base().'/persistent_cache/'.md5(serialize(get_self_url_easy()));
+			$url=static_cache_current_url();
+			$fast_cache_path=get_custom_file_base().'/static_cache/'.md5($url);
 			if ($bot_type===NULL) $fast_cache_path.='__non-bot';
 			if (!array_key_exists('js_on',$_COOKIE)) $fast_cache_path.='__no-js';
-			if (is_mobile()) $fast_cache_path.='_mobile';
-			$fast_cache_path.='.gcd';
-
-			if (!is_dir(get_custom_file_base().'/persistent_cache/'))
-			{
-				if (@mkdir(get_custom_file_base().'/persistent_cache/',0777))
-				{
-					fix_permissions(get_custom_file_base().'/persistent_cache/',0777);
-					sync_file(get_custom_file_base().'/persistent_cache/');
-				} else
-				{
-					intelligent_write_error($fast_cache_path);
-				}
-			}
+			if (is_mobile()) $fast_cache_path.='__mobile';
 
 			$out_evaluated=$out->evaluate(NULL,false);
+			$static_cache=$out_evaluated;
 
-			$myfile=@fopen($fast_cache_path,'ab') OR intelligent_write_error($fast_cache_path);
-			flock($myfile,LOCK_EX);
-			ftruncate($myfile,0);
-			if ((function_exists('gzencode')) && (php_function_allowed('ini_set')))
+			// Remove any sessions etc
+			$static_cache=preg_replace('#(&|&amp;|&amp;amp;|%3Aamp%3A|\?)?(keep_session|keep_devtest|keep_failover)(=|%3D)\d+#','',$static_cache);
+
+			if (!is_file($fast_cache_path.'.htm') || filemtime($fast_cache_path.'.htm')<time()-60*60*5)
 			{
-				fwrite($myfile,gzencode($out_evaluated,9));
-			} else
-			{
-				fwrite($myfile,$out_evaluated);
+				write_static_cache_file($fast_cache_path.'.htm',$static_cache,true);
 			}
-			flock($myfile,LOCK_UN);
-			fclose($myfile);
-			fix_permissions($fast_cache_path);
-			sync_file($fast_cache_path);
+
+			if ($supports_failover_mode)
+			{
+				if (!is_file($fast_cache_path.'__failover_mode.htm') || filemtime($fast_cache_path.'__failover_mode.htm')<time()-60*60*5)
+				{
+					// Add failover messages
+					if (!empty($SITE_INFO['failover_message_place_after']))
+					{
+						$static_cache=str_replace($SITE_INFO['failover_message_place_after'],$SITE_INFO['failover_message_place_after'].$SITE_INFO['failover_message'],$static_cache);
+					}
+					if (!empty($SITE_INFO['failover_message_place_before']))
+					{
+						$static_cache=str_replace($SITE_INFO['failover_message_place_before'],$SITE_INFO['failover_message'].$SITE_INFO['failover_message_place_before'],$static_cache);
+					}
+
+					// Disable all form controls
+					$static_cache=preg_replace('#<(textarea|input|select|button)#','<$1 disabled="disabled"',$static_cache);
+
+					write_static_cache_file($fast_cache_path.'__failover_mode.htm',$static_cache,false);
+				}
+
+				if (!empty($SITE_INFO['failover_apache_rewritemap_file']))
+				{
+					$url_stem=$url;
+					$url_stem=str_replace(get_base_url(true).'/','',$url_stem);
+					$url_stem=str_replace(get_base_url(false).'/','',$url_stem);
+					if (preg_match('#^'.$SITE_INFO['failover_apache_rewritemap_file'].'$#',$url_stem)!=0)
+					{
+						if (is_mobile())
+						{
+							$rewritemap_file=get_file_base().'/data_custom/failover_rewritemap__mobile.txt';
+						} else
+						{
+							$rewritemap_file=get_file_base().'/data_custom/failover_rewritemap.txt';
+						}
+						$rewritemap_file_contents=file_get_contents($rewritemap_file);
+						if (strpos($rewritemap_file_contents,"\n".$url_stem.' ')===false)
+						{
+							$rewritemap_file_contents.="\n".$url_stem.' '.$fast_cache_path.'__failover_mode.htm';
+							file_put_contents($rewritemap_file,$rewritemap_file_contents,LOCK_EX);
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -809,6 +839,43 @@ function do_site()
 	}
 
 	//exit();
+}
+
+/**
+ * Write out a static cache file.
+ *
+ * @param  PATH			Cache file path
+ * @param  string			Cache contents
+ * @param  boolean		Whether to allow gzipping
+ */
+function write_static_cache_file($fast_cache_path,$out_evaluated,$support_gzip)
+{
+	if (!is_dir(get_custom_file_base().'/static_cache/'))
+	{
+		if (@mkdir(get_custom_file_base().'/static_cache/',0777))
+		{
+			fix_permissions(get_custom_file_base().'/static_cache/',0777);
+			sync_file(get_custom_file_base().'/static_cache/');
+		} else
+		{
+			intelligent_write_error($fast_cache_path);
+		}
+	}
+
+	$myfile=@fopen($fast_cache_path,'ab') OR intelligent_write_error($fast_cache_path);
+	flock($myfile,LOCK_EX);
+	ftruncate($myfile,0);
+	if ((function_exists('gzencode')) && (php_function_allowed('ini_set')) && ($support_gzip))
+	{
+		fwrite($myfile,gzencode($out_evaluated,9));
+	} else
+	{
+		fwrite($myfile,$out_evaluated);
+	}
+	flock($myfile,LOCK_UN);
+	fclose($myfile);
+	fix_permissions($fast_cache_path);
+	sync_file($fast_cache_path);
 }
 
 /**
